@@ -33,7 +33,8 @@ public class OutboxClaimService {
                       event.aggregate_id,
                       event.event_type,
                       event.topic,
-                      event.payload
+                      event.payload,
+                      event.trace_context
             """;
 
     private final JdbcTemplate jdbc;
@@ -67,7 +68,8 @@ public class OutboxClaimService {
                 resultSet.getObject("aggregate_id", UUID.class),
                 resultSet.getString("event_type"),
                 resultSet.getString("topic"),
-                resultSet.getString("payload")
+                resultSet.getString("payload"),
+                resultSet.getString("trace_context")
         ));
     }
 
@@ -76,7 +78,8 @@ public class OutboxClaimService {
             UUID aggregateId,
             String eventType,
             String topic,
-            String payload
+            String payload,
+            String traceContext
     ) {
     }
 }
