@@ -22,6 +22,7 @@ public class OutboxRelay {
 
     private final OutboxClaimService claimer;
     private final OutboxStatusUpdater updater;
+    private final OutboxTraceContext traceContext;
     private final KafkaTemplate<String, String> kafka;
     private final ObservationRegistry observationRegistry;
     private final int batchSize;
@@ -32,6 +33,7 @@ public class OutboxRelay {
     public OutboxRelay(
             OutboxClaimService claimer,
             OutboxStatusUpdater updater,
+            OutboxTraceContext traceContext,
             KafkaTemplate<String, String> kafka,
             ObservationRegistry observationRegistry,
             @Value("${eventflow.outbox.batch-size}") int batchSize,
@@ -41,6 +43,7 @@ public class OutboxRelay {
     ) {
         this.claimer = claimer;
         this.updater = updater;
+        this.traceContext = traceContext;
         this.kafka = kafka;
         this.observationRegistry = observationRegistry;
         this.batchSize = batchSize;
@@ -55,10 +58,12 @@ public class OutboxRelay {
     }
 
     private void publishObserved(OutboxClaimService.ClaimedOutboxEvent event) {
-        Observation.createNotStarted("eventflow.outbox.publish", observationRegistry)
-                .lowCardinalityKeyValue("event.type", event.eventType())
-                .lowCardinalityKeyValue("messaging.destination", event.topic())
-                .observe(() -> publishOne(event));
+        traceContext.runWith(event.traceContext(), () ->
+                Observation.createNotStarted("eventflow.outbox.publish", observationRegistry)
+                        .lowCardinalityKeyValue("event.type", event.eventType())
+                        .lowCardinalityKeyValue("messaging.destination", event.topic())
+                        .observe(() -> publishOne(event))
+        );
     }
 
     private void publishOne(OutboxClaimService.ClaimedOutboxEvent event) {
