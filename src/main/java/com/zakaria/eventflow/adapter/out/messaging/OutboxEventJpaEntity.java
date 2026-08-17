@@ -27,6 +27,9 @@ class OutboxEventJpaEntity {
     @Column(nullable = false, columnDefinition = "text")
     String payload;
 
+    @Column(name = "trace_context", columnDefinition = "text")
+    String traceContext;
+
     @Column(name = "occurred_at", nullable = false)
     Instant occurredAt;
 
