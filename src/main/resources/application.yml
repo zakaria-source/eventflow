@@ -59,6 +59,10 @@ eventflow:
     claim-ttl-ms: 30000
   kafka:
     admin-enabled: true
+    consumer-retry:
+      backoff-ms: 250
+      retries: 2
     topics:
       order-created: orders.created.v1
-      order-created-dlt: orders.created.v1.DLT
+      order-created-publish-dlt: orders.created.v1.publish.DLT
+      order-created-consumer-dlt: orders.created.v1.consumer.DLT
