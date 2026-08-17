@@ -1,6 +1,6 @@
 # EventFlow
 
-**Production-style event-driven order processing platform** built to demonstrate backend engineering decisions beyond CRUD: transactional consistency, asynchronous messaging, concurrent idempotency, multi-replica work claiming, retries, distributed tracing, integration testing and containerized deployment.
+**Production-style event-driven order processing platform** built to demonstrate backend engineering decisions beyond CRUD: transactional consistency, asynchronous messaging, concurrent idempotency, multi-replica work claiming, bounded retries, dead-letter recovery, distributed tracing, integration testing and containerized deployment.
 
 > Java 21 · Spring Boot 3.5 · Apache Kafka · PostgreSQL · Flyway · Testcontainers · Micrometer/OpenTelemetry · Docker · Kubernetes
 
@@ -11,12 +11,10 @@ Most demo projects stop at `Controller -> Service -> Repository`. EventFlow focu
 - How do you persist business state **and** publish an event without a dual-write bug?
 - What happens when Kafka is temporarily unavailable?
 - How do multiple relay replicas avoid publishing the same pending row concurrently?
-- How do you recover work claimed by a relay pod that crashes?
-- How do you make consumers safe when Kafka delivers the same message more than once — even concurrently?
+- How do you make consumers safe under duplicate delivery?
+- What happens when a Kafka record is permanently unprocessable?
 - How do you preserve one trace when an event waits in PostgreSQL before Kafka sees it?
-- How do you prove the asynchronous path against real PostgreSQL and Kafka instances?
-
-EventFlow answers those questions with concrete implementation choices that are easy to inspect and discuss in a technical interview.
+- How do you prove those guarantees against real infrastructure rather than mocks?
 
 ## Architecture
 
@@ -26,38 +24,43 @@ flowchart LR
     API --> APP[CreateOrder use case]
     APP --> ORDERS[(orders)]
     APP -->|same DB transaction| OUTBOX[(outbox_events + W3C trace context)]
-    RELAY[Outbox relay replicas] -->|atomic claim lease| OUTBOX
-    RELAY -->|restored trace + orders.created.v1| KAFKA[(Kafka)]
+    RELAY[Outbox relay replicas] -->|SKIP LOCKED + lease| OUTBOX
+    RELAY -->|orders.created.v1| KAFKA[(Kafka)]
+    RELAY -->|publish exhausted| PDLT[(publish.DLT)]
     KAFKA --> CONSUMER[Order consumer]
-    CONSUMER -->|atomic claim| PROCESSED[(processed_events)]
+    CONSUMER -->|success| PROCESSED[(processed_events)]
     CONSUMER --> READ[(order_read_model)]
+    CONSUMER -->|retries exhausted| CDLT[(consumer.DLT)]
 ```
 
-The write path uses the **Transactional Outbox Pattern**. The HTTP request never tries to update PostgreSQL and Kafka independently. The order and its domain event are persisted in the same database transaction. A relay publishes committed outbox rows afterwards.
+The write path uses the **Transactional Outbox Pattern**. The HTTP request never tries to update PostgreSQL and Kafka independently. The order and its domain event are persisted in the same database transaction; publication happens afterwards.
 
-Before publishing, each relay atomically claims a batch with PostgreSQL `FOR UPDATE SKIP LOCKED` and stores `claimed_by` / `claimed_until`. The database transaction ends **before** the Kafka network call. Other replicas skip locked rows during the claim and ignore active leases afterwards. If a pod dies, its rows become eligible again when the lease expires.
+Before publishing, each relay atomically claims work using PostgreSQL `FOR UPDATE SKIP LOCKED` plus an expiring lease. The claim transaction ends before the Kafka network call, allowing multiple Kubernetes replicas to share work without holding database locks across broker latency.
 
-The W3C trace carrier is persisted with the outbox event. The relay restores it before starting its publish observation; Spring Kafka producer/listener observations then propagate that trace through Kafka headers. The request, delayed outbox publication and consumer processing can therefore remain part of the same distributed trace.
+The W3C trace carrier is persisted with the outbox row and restored before the relay publish observation. Spring Kafka producer/listener observations propagate that trace through Kafka headers, so the delayed asynchronous path can remain part of the same distributed trace.
 
-The consumer does not use a vulnerable `exists -> insert` sequence. It atomically claims an event with PostgreSQL `INSERT ... ON CONFLICT DO NOTHING`, then updates the projection in the **same transaction**. Duplicate delivery remains safe even when duplicates arrive concurrently.
+The consumer uses PostgreSQL `INSERT ... ON CONFLICT DO NOTHING` as an atomic inbox claim and writes its projection in the same transaction. Concurrent duplicate deliveries therefore create one projection.
+
+Permanent consumer failures have a separate recovery path: after bounded retries, Spring Kafka publishes the original record to `orders.created.v1.consumer.DLT`. This is intentionally separate from `orders.created.v1.publish.DLT`, which represents failures in the outbox publication stage.
 
 ## Main engineering decisions
 
 | Problem | Choice | Why |
 |---|---|---|
 | DB + Kafka dual write | Transactional outbox | Avoids losing an event after a committed order |
-| Concurrent relay replicas | `FOR UPDATE SKIP LOCKED` + persisted claim lease | Shares pending work without holding DB locks during Kafka calls |
-| Relay crash after claiming work | Expiring `claimed_until` lease | Abandoned rows automatically become eligible again |
-| Trace broken by async DB boundary | Persist + restore W3C trace carrier | Preserves business trace identity across the outbox delay |
-| Kafka trace propagation | Spring Kafka producer/listener observations | Injects/extracts trace context through message headers |
-| Kafka duplicate delivery | Atomic inbox claim | Removes the check-then-act race under concurrent duplicate delivery |
-| Consumer failure after claim | Claim + projection in one transaction | A failed projection rolls the claim back so Kafka can retry |
-| Broker outage | Persistent outbox + exponential retry | Business writes remain accepted while Kafka recovers |
-| Poison publication | Dead-letter topic after bounded attempts | Repeated publish failures become observable instead of retrying forever |
-| Schema evolution | Versioned topic/event name (`orders.created.v1`) | Makes compatibility explicit |
-| Database evolution | Flyway migrations | Reproducible schema across environments |
-| Production health | Spring Boot Actuator + Prometheus | Readiness/liveness and metrics are first-class |
-| Integration confidence | Testcontainers PostgreSQL + Kafka | Tests exercise the same infrastructure categories used at runtime |
+| Concurrent relay replicas | `FOR UPDATE SKIP LOCKED` + claim lease | Shares work without holding DB locks during Kafka calls |
+| Relay crash after claim | Expiring `claimed_until` | Abandoned rows automatically become eligible again |
+| Trace broken by DB-backed async boundary | Persist + restore W3C trace carrier | Preserves business trace identity across time/threads/replicas |
+| Kafka duplicate delivery | Atomic inbox claim | Removes the concurrent `exists -> insert` race |
+| Consumer failure after claim | Claim + projection in one DB transaction | Failure rolls both back so Kafka can retry safely |
+| Transient consumer failure | Bounded `DefaultErrorHandler` retries | Gives short-lived failures another chance |
+| Poison consumer record | Dedicated `consumer.DLT` | Prevents infinite retry and preserves diagnostics |
+| Relay publication exhaustion | Separate `publish.DLT` | Keeps publisher and consumer failure domains distinguishable |
+| Broker outage | Persistent outbox + exponential retry | Business writes remain durable while Kafka recovers |
+| Schema evolution | Versioned event/topic name | Makes compatibility explicit |
+| Database evolution | Flyway | Reproducible schema across environments |
+| Production operations | Actuator + Prometheus + OpenTelemetry | Health, metrics and traces are first-class |
+| Integration confidence | Testcontainers PostgreSQL + Kafka | Tests exercise runtime infrastructure categories |
 
 ## Package structure
 
@@ -75,7 +78,7 @@ src/main/java/com/zakaria/eventflow
         └── messaging/
 ```
 
-The dependency direction is intentional: the domain does not depend on Spring, Kafka, PostgreSQL, HTTP or OpenTelemetry. Trace propagation lives in the messaging adapter.
+The domain does not depend on Spring, Kafka, PostgreSQL, HTTP or OpenTelemetry. Infrastructure concerns remain in adapters.
 
 ## API
 
@@ -102,26 +105,16 @@ Useful endpoints:
 
 ## Observability
 
-EventFlow creates explicit Micrometer observations around:
+EventFlow creates explicit observations around:
 
 - `eventflow.outbox.publish`
 - `eventflow.order.projection`
+- Spring Kafka producer spans
+- Spring Kafka listener spans
 
-Spring Kafka observation is enabled for the producer template and listener container, adding the Kafka producer/consumer spans around those business observations.
+The outbox stores the W3C `traceparent` / `tracestate` carrier. The relay restores it from a fresh OpenTelemetry root context before its publish observation, preventing a scheduler span from accidentally becoming the business parent.
 
-### Trace propagation across the outbox
-
-A normal thread-local trace cannot survive this sequence by itself:
-
-```text
-HTTP request -> PostgreSQL commit -> time passes -> scheduler thread -> Kafka -> consumer thread
-```
-
-EventFlow therefore captures the current W3C trace carrier while the outbox row is written, stores it in `trace_context`, and restores it from a fresh OpenTelemetry root context before the relay creates its publish observation. That prevents the scheduler's own execution context from replacing the business parent.
-
-The Kafka producer observation runs inside the restored scope and propagates the context through Kafka headers. The listener observation extracts it before invoking the consumer.
-
-OTLP export is intentionally **disabled by default** so local development and CI do not depend on an external collector. To export traces to an OTLP-compatible collector:
+OTLP export is disabled by default so local development and CI do not depend on a collector:
 
 ```bash
 OTEL_TRACING_ENABLED=true \
@@ -130,7 +123,7 @@ TRACING_SAMPLING_PROBABILITY=1.0 \
 mvn spring-boot:run
 ```
 
-The current persisted carrier covers W3C trace context (`traceparent` / `tracestate`); application baggage propagation is not implemented yet.
+Application baggage propagation is not implemented yet.
 
 ## Test strategy
 
@@ -138,102 +131,104 @@ The current persisted carrier covers W3C trace context (`traceparent` / `tracest
 mvn verify
 ```
 
-The test suite covers different failure boundaries instead of relying on one oversized test.
-
-### Domain/unit tests
-Validate order invariants and use-case behavior without infrastructure.
-
 ### `OrderOutboxIT`
-Starts PostgreSQL with Testcontainers and proves the critical synchronous invariant: **the order and its outbox event are committed together**.
+PostgreSQL Testcontainers proves the synchronous invariant: **order + outbox event commit together**.
 
 ### `OrderPipelineIT`
-Starts both PostgreSQL and Kafka with Testcontainers and verifies the real asynchronous path:
+PostgreSQL + Kafka Testcontainers verifies:
 
 ```text
 CreateOrder
   -> orders + outbox_events
   -> claim lease
-  -> scheduled outbox relay
+  -> relay
   -> Kafka
   -> consumer
   -> processed_events
   -> order_read_model
 ```
 
-It also verifies that the outbox lease is released after successful publication.
+It also checks that the lease is released after successful publication.
 
 ### `OrderProjectionIdempotencyIT`
-Dispatches the **same event concurrently from 8 workers** and verifies exactly one processed-event claim and one projection.
+Dispatches the **same event concurrently from 8 workers** and requires exactly one processed-event claim and one projection.
 
 ### `OutboxClaimIT`
-Creates six pending events and launches two claim workers concurrently. Their batches must be disjoint, an immediate extra worker must find no work, and expired leases must be reclaimable.
+Launches two claim workers concurrently and proves disjoint batches plus recovery of expired leases.
 
 ### `OutboxTraceContextIT`
-Creates a real Micrometer parent span, writes an order/outbox row inside its scope, reads the stored W3C carrier from PostgreSQL, restores it outside the original scope and verifies that the same trace ID becomes current again.
+Creates a real Micrometer parent span, persists an event under it, restores the stored carrier later and verifies that the same trace ID becomes current again.
+
+### `ConsumerDltIT`
+Publishes malformed JSON to the real Kafka topic. The listener exhausts its retry budget, the original key/payload arrives in `orders.created.v1.consumer.DLT` with Spring Kafka failure metadata, and no read-model projection is created.
 
 ## Failure scenarios worth discussing
 
 ### PostgreSQL succeeds, Kafka is down
-The API transaction commits the order and outbox row. The relay retries later. No event is lost.
+The order and outbox row remain committed. The relay retries later; the business event is not lost.
 
-### Two relay pods poll the same pending queue
-Each worker claims rows using one atomic PostgreSQL statement. `FOR UPDATE SKIP LOCKED` separates concurrent claim transactions and the persisted lease prevents a second worker from taking already-claimed rows after the first transaction commits.
+### Two relay pods poll the same queue
+`SKIP LOCKED` separates concurrent claims and the persisted lease prevents another replica from immediately reclaiming committed work.
 
-### Relay crashes after claiming but before publishing
-The claim remains unavailable only until `claimed_until`. Once the lease expires, another replica can reclaim the event. The persisted trace carrier moves with the row, so failover does not lose the original trace parent.
+### A relay dies after claiming
+The event becomes eligible again after `claimed_until` expires.
 
-### Kafka acknowledges a message but the relay crashes before marking it published
-The row may be sent again after its lease expires. The consumer's event-ID claim makes re-delivery safe. EventFlow intentionally provides **at-least-once**, not magical exactly-once business delivery.
+### Kafka acknowledges, then the relay dies before `published_at`
+The event may be sent again after lease expiry. EventFlow intentionally provides **at-least-once delivery** and relies on consumer idempotency for correctness.
 
-### Two consumers receive the same event concurrently
-Both attempt the same atomic PostgreSQL claim. Only one transaction obtains the event ID; the other performs no projection work.
+### A valid event is delivered twice concurrently
+Only one consumer transaction wins the atomic inbox claim; one projection is written.
 
-### Consumer crashes while building its projection
-The `processed_events` claim and projection update share one transaction. Either both commit or both roll back.
+### A consumer receives malformed or permanently invalid data
+The record is retried a bounded number of times, then moved to the **consumer DLT** with failure metadata. The normal projection remains untouched.
+
+### The relay itself repeatedly cannot publish
+That is a different failure domain and uses the **publish DLT**, keeping operational triage separate from consumer poison records.
 
 ## Architecture Decision Records
 
 - [`ADR-0001`](docs/adr/0001-transactional-outbox.md) — Transactional outbox for DB/Kafka consistency
 - [`ADR-0002`](docs/adr/0002-atomic-consumer-idempotency.md) — Atomic consumer idempotency claim
-- [`ADR-0003`](docs/adr/0003-outbox-claim-lease.md) — Multi-replica outbox claiming with `SKIP LOCKED` and leases
-- [`ADR-0004`](docs/adr/0004-outbox-trace-context.md) — W3C trace propagation across the transactional outbox
+- [`ADR-0003`](docs/adr/0003-outbox-claim-lease.md) — Multi-replica outbox claiming with leases
+- [`ADR-0004`](docs/adr/0004-outbox-trace-context.md) — W3C trace propagation across the outbox
+- [`ADR-0005`](docs/adr/0005-consumer-dead-letter-policy.md) — Bounded consumer retries and dedicated DLT
 
 ## Roadmap
 
 - [x] Hexagonal package boundaries
 - [x] Transactional outbox
+- [x] Multi-instance outbox claiming + lease recovery
 - [x] Kafka publishing
-- [x] Atomic idempotent consumer / inbox claim
-- [x] Multi-instance outbox claiming with `SKIP LOCKED` + lease recovery
-- [x] Retry + DLT path
+- [x] Atomic idempotent consumer
+- [x] Separate publisher/consumer dead-letter paths
+- [x] Consumer poison-message retry/DLT policy
 - [x] PostgreSQL + Flyway
 - [x] PostgreSQL + Kafka Testcontainers coverage
-- [x] Concurrent duplicate-delivery integration test
-- [x] Concurrent outbox-claim integration test
-- [x] W3C trace propagation through transactional outbox + Kafka
-- [x] Prometheus metrics
-- [x] Micrometer/OpenTelemetry tracing
+- [x] Concurrent duplicate-delivery test
+- [x] Concurrent outbox-claim test
+- [x] W3C trace propagation through outbox + Kafka
+- [x] Prometheus metrics + OpenTelemetry tracing
 - [x] Docker Compose
 - [x] Kubernetes manifests
 - [x] GitHub Actions CI
-- [ ] Consumer-side poison-message retry/DLT policy
 - [ ] Avro/Protobuf + Schema Registry
-- [ ] Load test with k6
 - [ ] Outbox / inbox cleanup and retention policy
+- [ ] Load testing with k6
+- [ ] Harden outbox claim ownership against stale workers
 - [ ] Terraform deployment to AWS
 
 ## 30-minute interview walkthrough
 
-1. Dual-write problem and why the outbox exists.
+1. Dual-write problem and transactional outbox.
 2. Transaction boundaries in order creation.
-3. Why relay replicas use a short `SKIP LOCKED` claim transaction plus a persisted lease instead of holding row locks across Kafka calls.
-4. How W3C context survives the database-backed asynchronous boundary and why the relay restores from `Context.root()`.
-5. At-least-once Kafka semantics and why transport-level "exactly once" is not the business guarantee.
-6. Why `exists -> insert` is racy and how the atomic consumer claim fixes it.
-7. Retry/DLT behavior under failures.
+3. Multi-replica claim leases and why Kafka calls happen outside DB transactions.
+4. W3C trace propagation across a database-backed async boundary.
+5. At-least-once semantics and consumer idempotency.
+6. Why `exists -> insert` is unsafe under concurrent delivery.
+7. Publisher failure vs consumer poison-message failure and why they use separate DLTs.
 8. What each Testcontainers test proves — and what it does not prove.
-9. Kubernetes readiness/liveness, Prometheus metrics and distributed tracing.
-10. Changes needed at 10× / 100× traffic.
+9. Kubernetes readiness/liveness, metrics and traces.
+10. What changes at 10× and 100× traffic.
 
 ## License
 
