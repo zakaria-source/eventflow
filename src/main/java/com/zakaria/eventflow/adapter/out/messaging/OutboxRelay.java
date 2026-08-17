@@ -39,7 +39,7 @@ public class OutboxRelay {
             @Value("${eventflow.outbox.batch-size}") int batchSize,
             @Value("${eventflow.outbox.max-attempts}") int maxAttempts,
             @Value("${eventflow.outbox.claim-ttl-ms:30000}") long claimTtlMillis,
-            @Value("${eventflow.kafka.topics.order-created-dlt}") String dltTopic
+            @Value("${eventflow.kafka.topics.order-created-publish-dlt}") String dltTopic
     ) {
         this.claimer = claimer;
         this.updater = updater;
@@ -84,9 +84,9 @@ public class OutboxRelay {
         try {
             kafka.send(dltTopic, event.aggregateId().toString(), event.payload()).get(5, TimeUnit.SECONDS);
             updater.markPublished(event.eventId());
-            log.error("Moved event to DLT event={}", event.eventId());
+            log.error("Moved event to publish DLT event={}", event.eventId());
         } catch (Exception failure) {
-            log.error("DLT publish failed event={}", event.eventId(), failure);
+            log.error("Publish DLT failed event={}", event.eventId(), failure);
         }
     }
 }
