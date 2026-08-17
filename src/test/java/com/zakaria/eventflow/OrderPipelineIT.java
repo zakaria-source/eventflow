@@ -7,6 +7,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.testcontainers.containers.KafkaContainer;
@@ -22,6 +23,7 @@ import java.util.Currency;
 import static org.assertj.core.api.Assertions.assertThat;
 
 @Testcontainers
+@DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 @SpringBootTest(properties = {
         "eventflow.outbox.fixed-delay=100",
         "spring.kafka.admin.fail-fast=true",
@@ -80,16 +82,17 @@ class OrderPipelineIT {
                             "select count(*) from processed_events",
                             Integer.class
                     );
-                    String customerId = jdbc.queryForObject(
-                            "select customer_id from order_read_model where order_id = ?",
-                            String.class,
-                            order.id()
+                    Integer projectedWithExpectedCustomer = jdbc.queryForObject(
+                            "select count(*) from order_read_model where order_id = ? and customer_id = ?",
+                            Integer.class,
+                            order.id(),
+                            "customer-pipeline"
                     );
 
                     assertThat(published).isEqualTo(1);
                     assertThat(projected).isEqualTo(1);
                     assertThat(processed).isEqualTo(1);
-                    assertThat(customerId).isEqualTo("customer-pipeline");
+                    assertThat(projectedWithExpectedCustomer).isEqualTo(1);
                 });
     }
 }
