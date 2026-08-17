@@ -52,6 +52,7 @@ eventflow:
     fixed-delay: 1000
     batch-size: 100
     max-attempts: 5
+    claim-ttl-ms: 30000
   kafka:
     admin-enabled: true
     topics:
