@@ -73,6 +73,11 @@ class OrderPipelineIT {
                             Integer.class,
                             order.id()
                     );
+                    Integer activeClaims = jdbc.queryForObject(
+                            "select count(*) from outbox_events where aggregate_id = ? and (claimed_by is not null or claimed_until is not null)",
+                            Integer.class,
+                            order.id()
+                    );
                     Integer projected = jdbc.queryForObject(
                             "select count(*) from order_read_model where order_id = ?",
                             Integer.class,
@@ -90,6 +95,7 @@ class OrderPipelineIT {
                     );
 
                     assertThat(published).isEqualTo(1);
+                    assertThat(activeClaims).isZero();
                     assertThat(projected).isEqualTo(1);
                     assertThat(processed).isEqualTo(1);
                     assertThat(projectedWithExpectedCustomer).isEqualTo(1);
