@@ -1,0 +1,36 @@
+name: Engineering proposal
+description: Propose an architecture, reliability, performance, or operational improvement
+title: "[Proposal]: "
+labels: []
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or limitation
+      description: What system behavior, failure mode, scalability limit, or developer concern should be improved?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed approach
+      description: Describe the proposed design and the invariant it should preserve.
+    validations:
+      required: true
+  - type: textarea
+    id: tradeoffs
+    attributes:
+      label: Tradeoffs and alternatives
+      description: Cover complexity, consistency, delivery guarantees, operability, and alternatives where relevant.
+  - type: checkboxes
+    id: impact
+    attributes:
+      label: Impact areas
+      options:
+        - label: Database / transactions
+        - label: Kafka / delivery semantics
+        - label: Concurrency / idempotency
+        - label: Retry / dead-letter handling
+        - label: Observability
+        - label: Performance / scalability
+        - label: Kubernetes / deployment
