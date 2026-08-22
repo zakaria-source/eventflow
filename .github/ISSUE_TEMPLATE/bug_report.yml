@@ -1,0 +1,40 @@
+name: Bug report
+description: Report reproducible incorrect behavior or a broken invariant
+title: "[Bug]: "
+labels: []
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Describe the observed behavior and the expected invariant.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Include the relevant API call, event flow, or failure scenario.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Order API / transaction
+        - Outbox relay
+        - Kafka publishing
+        - Consumer / idempotency
+        - Retry / DLT
+        - PostgreSQL / Flyway
+        - Observability
+        - Docker / Kubernetes / CI
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: Add sanitized logs, test output, traces, or timing/concurrency details when useful.
